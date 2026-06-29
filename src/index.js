@@ -1315,7 +1315,7 @@ const getLoginHTML = (title) => `
     </style>
 </head>
 <body>
-    <a href="https://slink.661388.xyz/domain-autocheck" target="_blank" class="github-corner" title="GitHub Repository">
+    <a href="https://github.com/jy02739244/domain-autocheck" target="_blank" class="github-corner" title="GitHub Repository">
         <i class="iconfont icon-github1"></i>
     </a>
     <div class="login-container">
@@ -7464,7 +7464,7 @@ function addCopyrightFooter(html) {
   // 页脚图标颜色（使用CSS颜色值，如：#4e54c8、blue、rgba(0,0,0,0.7)等）
   const footerIconColor = 'white';
   
-  const footerContent = `<span style="color: var(--text-muted);">Copyright © 2025</span> &nbsp;|&nbsp; <i class="iconfont icon-github" style="font-size: ${footerIconSize}; color: var(--text-muted);"></i><a href="https://slink.661388.xyz/domain-autocheck" target="_blank" style="color: var(--text-main); text-decoration: none;">GitHub Repository</a> &nbsp;`;
+  const footerContent = `<span style="color: var(--text-muted);">Copyright © 2025</span> &nbsp;|&nbsp; <i class="iconfont icon-github" style="font-size: ${footerIconSize}; color: var(--text-muted);"></i><a href="https://github.com/jy02739244/domain-autocheck" target="_blank" style="color: var(--text-main); text-decoration: none;">GitHub Repository</a> &nbsp;`;
   
   const bodyEndIndex = html.lastIndexOf('</body>');
   
