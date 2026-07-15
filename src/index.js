@@ -10,8 +10,7 @@ import { connect } from 'cloudflare:sockets';
 // 环境变量声明（运行时由 injectEnv 注入）
 let DOMAIN_MONITOR, TOKEN, SITE_NAME, LOGO_URL,
     BACKGROUND_URL, MOBILE_BACKGROUND_URL,
-    TG_TOKEN, TG_ID,
-    p;
+    TG_TOKEN, TG_ID;
 
 // 将环境变量注入模块作用域，使已有的 typeof VAR !== 'undefined' 检查继续工作
 function injectEnv(env) {
@@ -23,8 +22,6 @@ function injectEnv(env) {
 	if (env.MOBILE_BACKGROUND_URL !== undefined) MOBILE_BACKGROUND_URL = env.MOBILE_BACKGROUND_URL;
 	if (env.TG_TOKEN !== undefined) TG_TOKEN = env.TG_TOKEN;
 	if (env.TG_ID !== undefined) TG_ID = env.TG_ID;
-	// TCP WHOIS 出站兜底：环境变量 p = host 或 host:port（未写端口默认 443）
-	if (env.p !== undefined) p = env.p;
 }
 
 // ================================
@@ -488,59 +485,15 @@ function formatWhoisSocketError(error, host) {
     return raw.includes('超时') ? raw : `WHOIS查询超时（${host || 'socket'}）`;
   }
   if (/stream was cancelled|network connection lost|connection reset|request failed|cannot connect|ECONNRESET|ECONNREFUSED|ENOTFOUND|getaddrinfo/i.test(raw)) {
-    return `${raw}（TCP 在当前运行环境不可达；可配置环境变量 p=host 或 host:port 作为出站兜底；未写端口默认 443）`;
+    return `${raw}（TCP ${host || ''}:43 在当前运行环境不可达；Workers 直连部分 whois 主机会失败，请依赖 RDAP/HTTP 通道）`.replace('TCP :43', 'TCP');
   }
   return raw;
-}
-
-// 解析 "host" / "host:port" / "[ipv6]:port"
-function parseHostPort(value, defaultPort) {
-  const raw = String(value || '').trim();
-  if (!raw) return null;
-  if (raw.startsWith('[')) {
-    const m = raw.match(/^\[([^\]]+)\](?::(\d+))?$/);
-    if (!m) return null;
-    return { host: m[1], port: m[2] ? parseInt(m[2], 10) : defaultPort };
-  }
-  const idx = raw.lastIndexOf(':');
-  if (idx > 0 && raw.indexOf(':') === idx && /^\d+$/.test(raw.slice(idx + 1))) {
-    return { host: raw.slice(0, idx), port: parseInt(raw.slice(idx + 1), 10) };
-  }
-  return { host: raw, port: defaultPort };
-}
-
-// 默认 p：双重 base64 编码的 host（源码中不写明文）
-// 解码：atob(atob(DEFAULT_P_B64))
-const DEFAULT_P_B64 = 'VUhKdmVIbEpVQzVEVFV4cGRYTnpjM011Ym1WMA==';
-
-function decodeDefaultPHost() {
-  try {
-    // 二次 base64 解码
-    const once = atob(DEFAULT_P_B64);
-    const twice = atob(once);
-    return String(twice || '').trim();
-  } catch (_) {
-    return '';
-  }
-}
-
-// 解析出站兜底端点：优先环境变量 p，否则用双重 base64 默认值。
-// p 未写端口时默认 443（与 ProxyIP 类出口一致；不是 whois 目标的 43）。
-function resolveOutboundP(defaultPort = 443) {
-  let raw = '';
-  if (typeof p !== 'undefined' && p) {
-    raw = String(p).trim();
-  }
-  if (!raw) {
-    raw = decodeDefaultPHost();
-  }
-  return parseHostPort(raw, defaultPort);
 }
 
 // TCP 建连超时（仅 opened 阶段；读写超时仍由 readWhoisFromSocket 控制）
 const WHOIS_TCP_CONNECT_TIMEOUT_MS = 5000;
 
-// 建立到 host:port 的 TCP socket（等待 opened，带硬超时，避免黑洞路由拖死业务路径）
+// 建立到 host:port 的 TCP socket（等待 opened，带硬超时）
 async function openTcpSocket(hostname, port, timeoutMs = WHOIS_TCP_CONNECT_TIMEOUT_MS) {
   const socket = connect({ hostname, port: Number(port) });
   let timedOut = false;
@@ -566,43 +519,6 @@ async function openTcpSocket(hostname, port, timeoutMs = WHOIS_TCP_CONNECT_TIMEO
   } finally {
     clearTimeout(timer);
   }
-}
-
-// 按策略打开 WHOIS socket：
-// 1) 直连 targetHost:targetPort（WHOIS 通常为 43）
-// 2) 环境变量 p（或双重 base64 默认 host）换出口再连：
-//    - p 未写端口 → 默认 443（ProxyIP 类出口）
-//    - p 写了 host:port → 使用该端口
-// 说明：直连失败后改连 p 主机；对部分 Cloudflare 上的 whois 目标，
-// 经 p:443 出口可以恢复访问（与早期双重 base64 默认行为一致）。
-async function openWhoisSocket(targetHost, targetPort = 43) {
-  const errors = [];
-  const port = Number(targetPort) || 43;
-
-  // 1) direct
-  try {
-    const sock = await openTcpSocket(targetHost, port);
-    return { socket: sock, via: 'direct' };
-  } catch (e) {
-    errors.push(`direct: ${e.message || e}`);
-  }
-
-  // 2) p 兜底：未写端口固定默认 443，不要改成 whois 的 43
-  const ep = resolveOutboundP(443);
-  if (ep && ep.host) {
-    const pPort = Number(ep.port) || 443;
-    try {
-      const sock = await openTcpSocket(ep.host, pPort);
-      return { socket: sock, via: `p:${ep.host}:${pPort}` };
-    } catch (e) {
-      errors.push(`p: ${e.message || e}`);
-    }
-  }
-
-  throw new Error(formatWhoisSocketError(
-    new Error(errors.join(' | ') || '无法建立 TCP 连接'),
-    targetHost
-  ));
 }
 
 // 在已打开的 socket 上发送 WHOIS 查询并读取响应
@@ -651,19 +567,19 @@ async function readWhoisFromSocket(socket, query, timeoutMs) {
   return text;
 }
 
-// 通用 socket WHOIS 查询：连 host:43，发送 query，读取全部响应文本（带超时）
-// 连接顺序：直连 → 环境变量 p（或双重 base64 默认 host；未写端口默认 443）
-// 建连阶段有 WHOIS_TCP_CONNECT_TIMEOUT_MS 硬超时，避免 socket.opened 挂起拖死 /api/whois 与定时任务。
+// 通用 socket WHOIS 查询：仅直连 host:43（不再使用 p / 默认出站中转）
+// 建连阶段有 WHOIS_TCP_CONNECT_TIMEOUT_MS 硬超时；读写超时由 timeoutMs 控制。
 async function _whoisSocketQuery(host, query, timeoutMs) {
-  const { socket, via } = await openWhoisSocket(host, 43);
+  let socket;
+  try {
+    socket = await openTcpSocket(host, 43);
+  } catch (e) {
+    throw new Error(formatWhoisSocketError(e, host));
+  }
   try {
     return await readWhoisFromSocket(socket, query, timeoutMs);
   } catch (e) {
-    let msg = e && e.message ? e.message : String(e);
-    if (via && via !== 'direct') {
-      msg = `${msg}（via ${via}）`;
-    }
-    throw new Error(msg);
+    throw new Error(e && e.message ? e.message : String(e));
   }
 }
 
@@ -1064,8 +980,19 @@ async function queryEuCcRdap(domain) {
 async function queryEuCcTcpWhois(domain) {
   try {
     const whoisText = await _whoisSocketQuery('whois.gname.com', domain, 15000);
+    const text = String(whoisText || '');
 
-    if (whoisText.includes('NOT FOUND') || whoisText.includes('No match') || whoisText.includes('Domain not found') || whoisText.includes('No Data Found')) {
+    // 仅在「像 WHOIS 文本」且明确未注册时才判定未注册，避免 HTML/杂讯
+    // 被 includes('No match') 或「无 Creation Date」误判成 success+未注册。
+    const looksLikeWhois = /Domain Name:|Creation Date:|Registrar:|Registry Expiry|Name Server:/i.test(text);
+    const clearlyUnregistered = (
+      /^\s*NOT FOUND\s*$/im.test(text) ||
+      /No match for/i.test(text) ||
+      /Domain not found\.?\s*$/im.test(text) ||
+      /No Data Found/i.test(text) ||
+      /Status:\s*free\b/i.test(text)
+    );
+    if (clearlyUnregistered && (looksLikeWhois || text.length < 500)) {
       return {
         success: true,
         domain: domain,
@@ -1075,34 +1002,53 @@ async function queryEuCcTcpWhois(domain) {
     }
 
     const parseField = (regex) => {
-      const match = whoisText.match(regex);
+      const match = text.match(regex);
       return match ? match[1].trim() : null;
     };
 
-    const createdOn = parseField(/Creation Date:\s*(.+)/i);
-    const expiresOn = parseField(/Registrar Registration Expiration Date:\s*(.+)/i);
-    const updatedOn = parseField(/Updated Date:\s*(.+)/i);
+    const createdOn = parseField(/Creation Date:\s*(.+)/i)
+      || parseField(/Created Date:\s*(.+)/i)
+      || parseField(/Created On:\s*(.+)/i);
+    const expiresOn = parseField(/Registrar Registration Expiration Date:\s*(.+)/i)
+      || parseField(/Registry Expiry Date:\s*(.+)/i)
+      || parseField(/Expir(?:y|ation) Date:\s*(.+)/i);
+    const updatedOn = parseField(/Updated Date:\s*(.+)/i)
+      || parseField(/Last Updated On:\s*(.+)/i);
     const registrar = parseField(/Registrar:\s*(.+)/i);
 
     const nameservers = [];
     const nsRegex = /Name Server:\s*(.+)/gi;
     let match;
-    while ((match = nsRegex.exec(whoisText)) !== null) {
+    while ((match = nsRegex.exec(text)) !== null) {
       nameservers.push(match[1].trim());
     }
 
     const statusList = [];
     const statusRegex = /Domain Status:\s*(.+)/gi;
-    while ((match = statusRegex.exec(whoisText)) !== null) {
+    while ((match = statusRegex.exec(text)) !== null) {
       statusList.push(match[1].trim());
     }
 
     const dnssec = parseField(/DNSSEC:\s*(.+)/i);
 
+    // 已注册域名应至少有注册日或到期日；否则视为解析失败（success:false），
+    // 让业务层继续走 RDAP，而不是显示「域名未注册」。
+    if (!createdOn && !expiresOn) {
+      const preview = text.replace(/\s+/g, ' ').trim().slice(0, 160);
+      return {
+        success: false,
+        error: preview
+          ? `未能从 WHOIS 文本解析注册/到期信息（响应预览: ${preview}）`
+          : 'WHOIS响应为空或无法解析',
+        domain: domain,
+        raw: whoisText
+      };
+    }
+
     return {
       success: true,
       domain: domain,
-      registered: !!createdOn,
+      registered: true,
       registrationDate: createdOn ? formatDate(createdOn) : null,
       expiryDate: expiresOn ? formatDate(expiresOn) : null,
       lastUpdated: updatedOn ? formatDate(updatedOn) : null,
@@ -2205,7 +2151,6 @@ const getWhoisApiHTML = (title) => `
                 <li>Stackryze：HTTP WHOIS API</li>
                 <li>一级域名：优先直连注册局 RDAP（如 Verisign），再 TCP WHOIS，最后 rdap.org 兜底</li>
                 <li>pp.ua / eu.cc：按其实际接入通道探测</li>
-                <li>TCP 失败时可配置环境变量 p=host 或 host:port 做 Workers 出站兜底（未写端口默认 443）</li>
             </ul>
         </div>
 
