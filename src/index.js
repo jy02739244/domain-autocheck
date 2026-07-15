@@ -23,7 +23,7 @@ function injectEnv(env) {
 	if (env.MOBILE_BACKGROUND_URL !== undefined) MOBILE_BACKGROUND_URL = env.MOBILE_BACKGROUND_URL;
 	if (env.TG_TOKEN !== undefined) TG_TOKEN = env.TG_TOKEN;
 	if (env.TG_ID !== undefined) TG_ID = env.TG_ID;
-	// TCP WHOIS 出站兜底：环境变量 p = host 或 host:port（未写端口时 WHOIS 用 43）
+	// TCP WHOIS 出站兜底：环境变量 p = host 或 host:port（未写端口默认 443）
 	if (env.p !== undefined) p = env.p;
 }
 
@@ -488,7 +488,7 @@ function formatWhoisSocketError(error, host) {
     return raw.includes('超时') ? raw : `WHOIS查询超时（${host || 'socket'}）`;
   }
   if (/stream was cancelled|network connection lost|connection reset|request failed|cannot connect|ECONNRESET|ECONNREFUSED|ENOTFOUND|getaddrinfo/i.test(raw)) {
-    return `${raw}（TCP 在当前运行环境不可达；可配置环境变量 p=host 或 host:port 作为出站兜底；未写端口时 WHOIS 使用目标端口 43）`;
+    return `${raw}（TCP 在当前运行环境不可达；可配置环境变量 p=host 或 host:port 作为出站兜底；未写端口默认 443）`;
   }
   return raw;
 }
@@ -525,8 +525,7 @@ function decodeDefaultPHost() {
 }
 
 // 解析出站兜底端点：优先环境变量 p，否则用双重 base64 默认值。
-// defaultPort：p 未写端口时使用。WHOIS 场景应传入目标端口（通常 43），
-// 不能默认 443——连上 p:443 并不等于连上 whois:43。
+// p 未写端口时默认 443（与 ProxyIP 类出口一致；不是 whois 目标的 43）。
 function resolveOutboundP(defaultPort = 443) {
   let raw = '';
   if (typeof p !== 'undefined' && p) {
@@ -572,10 +571,10 @@ async function openTcpSocket(hostname, port, timeoutMs = WHOIS_TCP_CONNECT_TIMEO
 // 按策略打开 WHOIS socket：
 // 1) 直连 targetHost:targetPort（WHOIS 通常为 43）
 // 2) 环境变量 p（或双重 base64 默认 host）换出口再连：
-//    - p 未写端口 → 使用 targetPort（与目标 whois 端口一致，而不是 443）
+//    - p 未写端口 → 默认 443（ProxyIP 类出口）
 //    - p 写了 host:port → 使用该端口
-// 说明：p 只是换连接主机/可选端口，不会做 HTTP CONNECT 隧道；
-// 连上 p 主机 ≠ 自动转到 targetHost。
+// 说明：直连失败后改连 p 主机；对部分 Cloudflare 上的 whois 目标，
+// 经 p:443 出口可以恢复访问（与早期双重 base64 默认行为一致）。
 async function openWhoisSocket(targetHost, targetPort = 43) {
   const errors = [];
   const port = Number(targetPort) || 43;
@@ -588,10 +587,10 @@ async function openWhoisSocket(targetHost, targetPort = 43) {
     errors.push(`direct: ${e.message || e}`);
   }
 
-  // 2) p 兜底：未写端口时跟目标 whois 端口，避免误连 p:443 当 WHOIS
-  const ep = resolveOutboundP(port);
+  // 2) p 兜底：未写端口固定默认 443，不要改成 whois 的 43
+  const ep = resolveOutboundP(443);
   if (ep && ep.host) {
-    const pPort = Number(ep.port) || port;
+    const pPort = Number(ep.port) || 443;
     try {
       const sock = await openTcpSocket(ep.host, pPort);
       return { socket: sock, via: `p:${ep.host}:${pPort}` };
@@ -653,7 +652,7 @@ async function readWhoisFromSocket(socket, query, timeoutMs) {
 }
 
 // 通用 socket WHOIS 查询：连 host:43，发送 query，读取全部响应文本（带超时）
-// 连接顺序：直连 → 环境变量 p（或双重 base64 默认 host；未写端口则用 43）
+// 连接顺序：直连 → 环境变量 p（或双重 base64 默认 host；未写端口默认 443）
 // 建连阶段有 WHOIS_TCP_CONNECT_TIMEOUT_MS 硬超时，避免 socket.opened 挂起拖死 /api/whois 与定时任务。
 async function _whoisSocketQuery(host, query, timeoutMs) {
   const { socket, via } = await openWhoisSocket(host, 43);
@@ -662,12 +661,7 @@ async function _whoisSocketQuery(host, query, timeoutMs) {
   } catch (e) {
     let msg = e && e.message ? e.message : String(e);
     if (via && via !== 'direct') {
-      // p 仅换连接主机，不是到 targetHost 的隧道；连上 p 后读超时/空响应很常见
-      if (/超时|空|响应为空|未能从WHOIS/i.test(msg)) {
-        msg = `${msg}（via ${via}；已连 p 主机而非目标 ${host} 隧道，若 p 不是可用的 :43 出口会读超时/空响应）`;
-      } else {
-        msg = `${msg}（via ${via}）`;
-      }
+      msg = `${msg}（via ${via}）`;
     }
     throw new Error(msg);
   }
@@ -2211,7 +2205,7 @@ const getWhoisApiHTML = (title) => `
                 <li>Stackryze：HTTP WHOIS API</li>
                 <li>一级域名：优先直连注册局 RDAP（如 Verisign），再 TCP WHOIS，最后 rdap.org 兜底</li>
                 <li>pp.ua / eu.cc：按其实际接入通道探测</li>
-                <li>TCP 失败时可配置环境变量 p=host 或 host:port 做 Workers 出站兜底（未写端口则用 43）</li>
+                <li>TCP 失败时可配置环境变量 p=host 或 host:port 做 Workers 出站兜底（未写端口默认 443）</li>
             </ul>
         </div>
 
