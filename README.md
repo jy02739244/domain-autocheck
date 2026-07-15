@@ -8,7 +8,7 @@
 * Cloudflare KV 持久化存储
 * 支持 Telegram 到期提醒
 * 支持一级域名 WHOIS 自动查询（基于免费 RDAP，无需 API Key）
-* 支持指定二级域名自动查询：`pp.ua`、`us.kg`、`xx.kg`、`qzz.io`、`dpdns.org`、`eu.cc`
+* 支持指定二级域名自动查询：`pp.ua`、`us.kg`、`xx.kg`、`qzz.io`、`dpdns.org`、`eu.cc`、`indevs.in`、`sryze.cc`、`ryzedns.org`、`nx.kg`
 
 ## ✅二级域名自动查询
 支持以下二级域名自动识别注册商、注册日期、到期日期、续期链接，并默认续期周期 1 年：
@@ -21,6 +21,10 @@
 | `qzz.io` | https://domain.digitalplat.org |
 | `dpdns.org` | https://domain.digitalplat.org |
 | `eu.cc` | https://www.gname.com |
+| `indevs.in` | https://domain.stackryze.com |
+| `sryze.cc` | https://domain.stackryze.com |
+| `ryzedns.org` | https://domain.stackryze.com |
+| `nx.kg` | https://domain.stackryze.com |
 
 ## 📌项目说明
 本项目主要是和 AI 沟通创作而成，小伙伴可自行进行完善或魔改。
@@ -120,4 +124,4 @@ Fork 部署可以保持与上游仓库的关联，方便后续通过 **Sync fork
 > 🚨如果你在代码中手动填写了变量，更新前请先备份这些值。
 
 ## ⭐ Star 星星走起
-![Star History](https://api.star-history.com/svg?repos=jy02739244/Domain-AutoCheck&type=Date)
+![Star History](https://api.star-history.com/svg?repos=jy02739244/domain-autocheck&type=Date)

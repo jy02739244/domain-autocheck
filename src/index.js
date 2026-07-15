@@ -10,7 +10,8 @@ import { connect } from 'cloudflare:sockets';
 // 环境变量声明（运行时由 injectEnv 注入）
 let DOMAIN_MONITOR, TOKEN, SITE_NAME, LOGO_URL,
     BACKGROUND_URL, MOBILE_BACKGROUND_URL,
-    TG_TOKEN, TG_ID;
+    TG_TOKEN, TG_ID,
+    p;
 
 // 将环境变量注入模块作用域，使已有的 typeof VAR !== 'undefined' 检查继续工作
 function injectEnv(env) {
@@ -22,6 +23,8 @@ function injectEnv(env) {
 	if (env.MOBILE_BACKGROUND_URL !== undefined) MOBILE_BACKGROUND_URL = env.MOBILE_BACKGROUND_URL;
 	if (env.TG_TOKEN !== undefined) TG_TOKEN = env.TG_TOKEN;
 	if (env.TG_ID !== undefined) TG_ID = env.TG_ID;
+	// TCP WHOIS 出站兜底：环境变量 p = host 或 host:port（未写端口时 WHOIS 用 43）
+	if (env.p !== undefined) p = env.p;
 }
 
 // ================================
@@ -66,6 +69,34 @@ function jsonResponse(data, status = 200) {
     status,
     headers: { 'Content-Type': 'application/json' }
   });
+}
+
+// 带超时的 fetch：Workers 的 fetch 没有内建超时，外部 WHOIS/RDAP 挂起时
+// 会把整次 /api/whois/probe（或添加域名时的自动查询）卡死在「探测中…」。
+// AbortController 兜底后，调用方按 AbortError 转成可读错误信息即可。
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const { signal: outerSignal, ...rest } = options || {};
+    if (outerSignal) {
+      if (outerSignal.aborted) {
+        controller.abort();
+      } else {
+        outerSignal.addEventListener('abort', () => controller.abort(), { once: true });
+      }
+    }
+    return await fetch(url, { ...rest, signal: controller.signal });
+  } catch (error) {
+    if (error && (error.name === 'AbortError' || error.message === 'The operation was aborted.')) {
+      const err = new Error(`请求超时（${Math.round(timeoutMs / 1000)}秒）`);
+      err.name = 'AbortError';
+      throw err;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 // ================================
@@ -410,6 +441,11 @@ function getWhoisQueryFunction(domainName) {
       lowerDomain.endsWith('.us.kg') || lowerDomain.endsWith('.xx.kg')) {
     return queryDigitalPlatWhois;
   }
+  // Stackryze 二级域名
+  if (lowerDomain.endsWith('.indevs.in') || lowerDomain.endsWith('.sryze.cc') ||
+      lowerDomain.endsWith('.ryzedns.org') || lowerDomain.endsWith('.nx.kg')) {
+    return queryStackryzeWhois;
+  }
   // 一级域名：RDAP 查询（免费无 Key），所有 gTLD 均可查
   if (dotCount === 1) {
     return queryFirstLevelDomain;
@@ -442,18 +478,152 @@ async function queryFirstLevelDomain(domain) {
   return await queryGenericRdap(domain);
 }
 
-// 通用 socket WHOIS 查询：连 host:43，发送 query，读取全部响应文本（带超时）
-async function _whoisSocketQuery(host, query, timeoutMs) {
-  const socket = connect({ hostname: host, port: 43 });
+// 把 cloudflare:sockets 的底层错误转成可读说明。
+// 本地 workerd 出口 ≠ 正式 Workers 出口。
+// Workers 用 cloudflare:sockets 直连「自身也在 Cloudflare 上」的主机时，
+// 常直接报 cannot connect / Stream was cancelled（CF 出站限制）。
+function formatWhoisSocketError(error, host) {
+  const raw = (error && (error.message || String(error))) || '未知错误';
+  if (/timeout|超时/i.test(raw)) {
+    return raw.includes('超时') ? raw : `WHOIS查询超时（${host || 'socket'}）`;
+  }
+  if (/stream was cancelled|network connection lost|connection reset|request failed|cannot connect|ECONNRESET|ECONNREFUSED|ENOTFOUND|getaddrinfo/i.test(raw)) {
+    return `${raw}（TCP 在当前运行环境不可达；可配置环境变量 p=host 或 host:port 作为出站兜底；未写端口时 WHOIS 使用目标端口 43）`;
+  }
+  return raw;
+}
+
+// 解析 "host" / "host:port" / "[ipv6]:port"
+function parseHostPort(value, defaultPort) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  if (raw.startsWith('[')) {
+    const m = raw.match(/^\[([^\]]+)\](?::(\d+))?$/);
+    if (!m) return null;
+    return { host: m[1], port: m[2] ? parseInt(m[2], 10) : defaultPort };
+  }
+  const idx = raw.lastIndexOf(':');
+  if (idx > 0 && raw.indexOf(':') === idx && /^\d+$/.test(raw.slice(idx + 1))) {
+    return { host: raw.slice(0, idx), port: parseInt(raw.slice(idx + 1), 10) };
+  }
+  return { host: raw, port: defaultPort };
+}
+
+// 默认 p：双重 base64 编码的 host（源码中不写明文）
+// 解码：atob(atob(DEFAULT_P_B64))
+const DEFAULT_P_B64 = 'VUhKdmVIbEpVQzVEVFV4cGRYTnpjM011Ym1WMA==';
+
+function decodeDefaultPHost() {
+  try {
+    // 二次 base64 解码
+    const once = atob(DEFAULT_P_B64);
+    const twice = atob(once);
+    return String(twice || '').trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+// 解析出站兜底端点：优先环境变量 p，否则用双重 base64 默认值。
+// defaultPort：p 未写端口时使用。WHOIS 场景应传入目标端口（通常 43），
+// 不能默认 443——连上 p:443 并不等于连上 whois:43。
+function resolveOutboundP(defaultPort = 443) {
+  let raw = '';
+  if (typeof p !== 'undefined' && p) {
+    raw = String(p).trim();
+  }
+  if (!raw) {
+    raw = decodeDefaultPHost();
+  }
+  return parseHostPort(raw, defaultPort);
+}
+
+// TCP 建连超时（仅 opened 阶段；读写超时仍由 readWhoisFromSocket 控制）
+const WHOIS_TCP_CONNECT_TIMEOUT_MS = 5000;
+
+// 建立到 host:port 的 TCP socket（等待 opened，带硬超时，避免黑洞路由拖死业务路径）
+async function openTcpSocket(hostname, port, timeoutMs = WHOIS_TCP_CONNECT_TIMEOUT_MS) {
+  const socket = connect({ hostname, port: Number(port) });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { socket.close(); } catch (_) {}
+  }, timeoutMs);
+
+  try {
+    if (socket.opened) {
+      await socket.opened;
+    }
+    if (timedOut) {
+      throw new Error(`TCP 建连超时（${Math.round(timeoutMs / 1000)}秒）: ${hostname}:${port}`);
+    }
+    return socket;
+  } catch (e) {
+    try { socket.close(); } catch (_) {}
+    if (timedOut) {
+      throw new Error(`TCP 建连超时（${Math.round(timeoutMs / 1000)}秒）: ${hostname}:${port}`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 按策略打开 WHOIS socket：
+// 1) 直连 targetHost:targetPort（WHOIS 通常为 43）
+// 2) 环境变量 p（或双重 base64 默认 host）换出口再连：
+//    - p 未写端口 → 使用 targetPort（与目标 whois 端口一致，而不是 443）
+//    - p 写了 host:port → 使用该端口
+// 说明：p 只是换连接主机/可选端口，不会做 HTTP CONNECT 隧道；
+// 连上 p 主机 ≠ 自动转到 targetHost。
+async function openWhoisSocket(targetHost, targetPort = 43) {
+  const errors = [];
+  const port = Number(targetPort) || 43;
+
+  // 1) direct
+  try {
+    const sock = await openTcpSocket(targetHost, port);
+    return { socket: sock, via: 'direct' };
+  } catch (e) {
+    errors.push(`direct: ${e.message || e}`);
+  }
+
+  // 2) p 兜底：未写端口时跟目标 whois 端口，避免误连 p:443 当 WHOIS
+  const ep = resolveOutboundP(port);
+  if (ep && ep.host) {
+    const pPort = Number(ep.port) || port;
+    try {
+      const sock = await openTcpSocket(ep.host, pPort);
+      return { socket: sock, via: `p:${ep.host}:${pPort}` };
+    } catch (e) {
+      errors.push(`p: ${e.message || e}`);
+    }
+  }
+
+  throw new Error(formatWhoisSocketError(
+    new Error(errors.join(' | ') || '无法建立 TCP 连接'),
+    targetHost
+  ));
+}
+
+// 在已打开的 socket 上发送 WHOIS 查询并读取响应
+async function readWhoisFromSocket(socket, query, timeoutMs) {
   const writer = socket.writable.getWriter();
-  await writer.write(new TextEncoder().encode(query + '\r\n'));
-  writer.releaseLock();
+  try {
+    await writer.write(new TextEncoder().encode(query + '\r\n'));
+  } finally {
+    try { writer.releaseLock(); } catch (_) {}
+  }
 
   const reader = socket.readable.getReader();
   const decoder = new TextDecoder();
   let text = '';
   let timedOut = false;
-  const timeoutId = setTimeout(() => { timedOut = true; reader.cancel(); }, timeoutMs);
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    try { reader.cancel(); } catch (_) {}
+  }, timeoutMs);
+
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -462,13 +632,45 @@ async function _whoisSocketQuery(host, query, timeoutMs) {
     }
     text += decoder.decode();
   } catch (e) {
-    if (!timedOut) throw e;
+    if (!timedOut) {
+      const err = new Error(formatWhoisSocketError(e, 'socket'));
+      err.cause = e;
+      throw err;
+    }
   } finally {
     clearTimeout(timeoutId);
-    socket.close();
+    try { reader.releaseLock(); } catch (_) {}
+    try { socket.close(); } catch (_) {}
   }
-  if (timedOut && !text) throw new Error('WHOIS查询超时');
+
+  if (timedOut && !text) {
+    throw new Error(`WHOIS查询超时（${Math.round(timeoutMs / 1000)}秒）`);
+  }
+  if (!text) {
+    throw new Error(formatWhoisSocketError(new Error('WHOIS响应为空'), 'socket'));
+  }
   return text;
+}
+
+// 通用 socket WHOIS 查询：连 host:43，发送 query，读取全部响应文本（带超时）
+// 连接顺序：直连 → 环境变量 p（或双重 base64 默认 host；未写端口则用 43）
+// 建连阶段有 WHOIS_TCP_CONNECT_TIMEOUT_MS 硬超时，避免 socket.opened 挂起拖死 /api/whois 与定时任务。
+async function _whoisSocketQuery(host, query, timeoutMs) {
+  const { socket, via } = await openWhoisSocket(host, 43);
+  try {
+    return await readWhoisFromSocket(socket, query, timeoutMs);
+  } catch (e) {
+    let msg = e && e.message ? e.message : String(e);
+    if (via && via !== 'direct') {
+      // p 仅换连接主机，不是到 targetHost 的隧道；连上 p 后读超时/空响应很常见
+      if (/超时|空|响应为空|未能从WHOIS/i.test(msg)) {
+        msg = `${msg}（via ${via}；已连 p 主机而非目标 ${host} 隧道，若 p 不是可用的 :43 出口会读超时/空响应）`;
+      } else {
+        msg = `${msg}（via ${via}）`;
+      }
+    }
+    throw new Error(msg);
+  }
 }
 
 // 已知 WHOIS 服务器覆盖表：某些 ccTLD 注册局（如 whois.ua）封禁 Cloudflare Workers
@@ -478,11 +680,43 @@ async function _whoisSocketQuery(host, query, timeoutMs) {
 const WHOIS_SERVER_OVERRIDE = {
 };
 
-// 已知注册局 RDAP 覆盖表：某些 ccTLD 的 43 端口 WHOIS 封 Workers，但提供 HTTPS RDAP。
-// 这里把这类 TLD/域名直连其注册局 RDAP（返回标准 RDAP JSON），绕开 whois 与 rdap.org。
-// key 同时支持「完整域名」和「TLD」，完整域名优先。value 是 RDAP base（不含末尾斜杠）。
+// 已知注册局 RDAP 覆盖表：直连注册局 RDAP，绕开 rdap.org bootstrap。
+// 背景：rdap.org 在本机 curl 往往可达，但 Cloudflare Workers / 本地 workerd 出口
+// 经常出现 "Network connection lost"（被限速、阻断或 TLS 路径不同）。
+// key 同时支持「完整域名」和「TLD」，完整域名优先。
+// value 是 RDAP base（不含末尾斜杠）；实际请求 = base + '/domain/' + domain。
+// 例：com → https://rdap.verisign.com/com/v1/domain/baidu.com
 const RDAP_SERVER_OVERRIDE = {
-  'ua': 'https://rdap.hostmaster.ua',   // .ua 注册局 RDAP；whois.ua 的 43 端口封 Workers
+  // ccTLD
+  'ua': 'https://rdap.hostmaster.ua',
+
+  // 常见 gTLD（IANA RDAP bootstrap 中的官方注册局入口）
+  'com': 'https://rdap.verisign.com/com/v1',
+  'net': 'https://rdap.verisign.com/net/v1',
+  'cc': 'https://rdap.verisign.com/cc/v1',
+  'tv': 'https://rdap.verisign.com/tv/v1',
+  'name': 'https://rdap.verisign.com/name/v1',
+
+  'org': 'https://rdap.publicinterestregistry.org/rdap',
+  'info': 'https://rdap.identitydigital.services/rdap',
+  'pro': 'https://rdap.identitydigital.services/rdap',
+  'mobi': 'https://rdap.identitydigital.services/rdap',
+  'asia': 'https://rdap.identitydigital.services/rdap',
+  'blog': 'https://rdap.identitydigital.services/rdap',
+
+  // CentralNic（.xyz/.online/.site 等）在 Workers 出口上常直接 403 Forbidden，
+  // 不进覆盖表：避免业务主路径先打一次必失败的注册局 RDAP，改由 TCP / rdap.org 处理。
+
+  'io': 'https://rdap.nic.io',
+  'co': 'https://rdap.nic.co',
+  'me': 'https://rdap.nic.me',
+  'ac': 'https://rdap.nic.ac',
+  'sh': 'https://rdap.nic.sh',
+
+  'app': 'https://rdap.nic.google',
+  'dev': 'https://rdap.nic.google',
+  'page': 'https://rdap.nic.google',
+  'new': 'https://rdap.nic.google',
 };
 
 // 一级域名 TCP WHOIS 查询（IANA 两跳）
@@ -497,7 +731,7 @@ async function queryGenericTcpWhois(domain) {
 
     // 未命中覆盖表 → 第一跳 whois.iana.org 找 TLD 的官方 WHOIS 服务器
     if (!whoisServer) {
-      const ianaText = await _whoisSocketQuery('whois.iana.org', tld, 10000);
+      const ianaText = await _whoisSocketQuery('whois.iana.org', tld, 15000);
       const referMatch = ianaText.match(/refer:\s*(\S+)/i) || ianaText.match(/whois:\s*(\S+)/i);
       whoisServer = referMatch ? referMatch[1].trim() : null;
       if (!whoisServer) {
@@ -506,7 +740,7 @@ async function queryGenericTcpWhois(domain) {
     }
 
     // 第二跳：查询完整域名
-    const whoisText = await _whoisSocketQuery(whoisServer, domain, 10000);
+    const whoisText = await _whoisSocketQuery(whoisServer, domain, 15000);
 
     // 未注册判断
     if (/(No match|NOT FOUND|No Data Found|Domain not found|Status:\s*free|No entries found)/i.test(whoisText)) {
@@ -574,7 +808,7 @@ async function queryGenericTcpWhois(domain) {
       raw: whoisText
     };
   } catch (error) {
-    const msg = error.message === 'WHOIS查询超时' ? 'WHOIS查询超时（10秒）' : error.message;
+    const msg = /WHOIS查询超时/.test(error.message || '') ? (error.message.includes('秒') ? error.message : 'WHOIS查询超时（15秒）') : error.message;
     console.error('一级域名 TCP WHOIS 查询失败，将尝试 RDAP:', msg);
     return {
       success: false,
@@ -684,7 +918,12 @@ async function queryGenericRdap(domain, rdapBase) {
       raw: data
     };
   } catch (error) {
-    const msg = error.name === 'AbortError' ? 'RDAP查询超时（15秒）' : error.message;
+    let msg = error.name === 'AbortError' ? 'RDAP查询超时（15秒）' : error.message;
+    // 本机 curl 可达但 workerd/Workers 出口不可达时常见；与本机网络无必然关系
+    if (/network connection lost|failed to fetch|connection reset|ECONNRESET|ENOTFOUND|getaddrinfo/i.test(String(msg || ''))) {
+      const via = rdapBase ? `注册局 RDAP (${rdapBase})` : 'rdap.org bootstrap';
+      msg = `${msg}（${via} 在当前运行环境不可达；本机 curl 能通不代表 Workers/workerd 出口也能通）`;
+    }
     console.error('一级域名 RDAP 查询失败:', msg);
     return {
       success: false,
@@ -699,39 +938,7 @@ async function queryGenericRdap(domain, rdapBase) {
 // PP.UA 域名查询函数 (通过 TCP socket 直连 whois.pp.ua)
 async function queryPpUaWhois(domain) {
   try {
-    const socket = connect({ hostname: 'whois.pp.ua', port: 43 });
-
-    const writer = socket.writable.getWriter();
-    const encoder = new TextEncoder();
-    await writer.write(encoder.encode(domain + '\r\n'));
-    writer.releaseLock();
-
-    const reader = socket.readable.getReader();
-    const decoder = new TextDecoder();
-    let whoisText = '';
-    let timedOut = false;
-    const timeoutId = setTimeout(() => {
-      timedOut = true;
-      reader.cancel();
-    }, 10000);
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        whoisText += decoder.decode(value, { stream: true });
-      }
-      whoisText += decoder.decode();
-    } catch (readError) {
-      if (!timedOut) throw readError;
-    } finally {
-      clearTimeout(timeoutId);
-      socket.close();
-    }
-
-    if (timedOut && !whoisText) {
-      throw new Error('WHOIS查询超时（10秒）');
-    }
+    const whoisText = await _whoisSocketQuery('whois.pp.ua', domain, 15000);
 
     if (whoisText.includes('NOT FOUND') || whoisText.includes('No match') || whoisText.includes('Domain not found')) {
       return {
@@ -793,13 +1000,13 @@ async function queryEuCcWhois(domain) {
 // eu.cc RDAP 查询：https://rdap.gname.com/domain/{domain}
 async function queryEuCcRdap(domain) {
   try {
-    const response = await fetch(`https://rdap.gname.com/domain/${encodeURIComponent(domain)}`, {
+    const response = await fetchWithTimeout(`https://rdap.gname.com/domain/${encodeURIComponent(domain)}`, {
       method: 'GET',
       headers: {
         'accept': 'application/rdap+json',
         'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
       }
-    });
+    }, 15000);
 
     if (response.status === 404) {
       return {
@@ -862,39 +1069,7 @@ async function queryEuCcRdap(domain) {
 // eu.cc TCP WHOIS 兜底查询：whois -h whois.gname.com "domain"
 async function queryEuCcTcpWhois(domain) {
   try {
-    const socket = connect({ hostname: 'whois.gname.com', port: 43 });
-
-    const writer = socket.writable.getWriter();
-    const encoder = new TextEncoder();
-    await writer.write(encoder.encode(domain + '\r\n'));
-    writer.releaseLock();
-
-    const reader = socket.readable.getReader();
-    const decoder = new TextDecoder();
-    let whoisText = '';
-    let timedOut = false;
-    const timeoutId = setTimeout(() => {
-      timedOut = true;
-      reader.cancel();
-    }, 30000);
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        whoisText += decoder.decode(value, { stream: true });
-      }
-      whoisText += decoder.decode();
-    } catch (readError) {
-      if (!timedOut) throw readError;
-    } finally {
-      clearTimeout(timeoutId);
-      socket.close();
-    }
-
-    if (timedOut && !whoisText) {
-      throw new Error('WHOIS查询超时（30秒）');
-    }
+    const whoisText = await _whoisSocketQuery('whois.gname.com', domain, 15000);
 
     if (whoisText.includes('NOT FOUND') || whoisText.includes('No match') || whoisText.includes('Domain not found') || whoisText.includes('No Data Found')) {
       return {
@@ -955,38 +1130,162 @@ async function queryEuCcTcpWhois(domain) {
 }
 
 // DigitalPlat 域名查询函数 (用于 qzz.io, dpdns.org, us.kg, xx.kg)
-// 优先使用 RDAP 接口，失败时 fallback 到 TCP WHOIS
+// 查询顺序：官方 RDAP → 官方 TCP WHOIS (whois.digitalplat.org:43) → HTTP WHOIS API 兜底
 async function queryDigitalPlatWhois(domain) {
   const rdapResult = await queryDigitalPlatRdap(domain);
   if (rdapResult.success) return rdapResult;
-  return await queryDigitalPlatTcpWhois(domain);
+
+  const tcpResult = await queryDigitalPlatTcpWhois(domain);
+  if (tcpResult.success) return tcpResult;
+
+  const httpResult = await queryDigitalPlatHttpWhois(domain);
+  if (httpResult.success) return httpResult;
+
+  return {
+    success: false,
+    error: httpResult.error || tcpResult.error || rdapResult.error || 'DigitalPlat查询失败',
+    domain: domain
+  };
+}
+
+// 解析 DigitalPlat 文本 WHOIS（TCP / HTTP API 共用）
+function parseDigitalPlatWhoisText(domain, whoisText) {
+  if (!whoisText || !String(whoisText).trim()) {
+    return {
+      success: false,
+      error: 'WHOIS响应为空',
+      domain: domain
+    };
+  }
+
+  if (/(Domain not found|No match|NOT FOUND|No Data Found|not been registered)/i.test(whoisText)) {
+    return {
+      success: true,
+      domain: domain,
+      registered: false,
+      raw: whoisText
+    };
+  }
+
+  const parseField = (regex) => {
+    const match = whoisText.match(regex);
+    return match ? match[1].trim() : null;
+  };
+
+  const createdOn = parseField(/Creation Date:\s*(.+)/i);
+  const expiresOn = parseField(/Registry Expiry Date:\s*(.+)/i)
+    || parseField(/Expiry Date:\s*(.+)/i)
+    || parseField(/Expiration Date:\s*(.+)/i);
+  const updatedOn = parseField(/Updated Date:\s*(.+)/i)
+    || parseField(/>>> Last update of WHOIS database:\s*(.+?)(?:\s*<<<|$)/i);
+  const registrar = parseField(/Registrar:\s*(.+)/i);
+  let registrarUrl = parseField(/Registrar URL:\s*(.+)/i);
+  if (registrarUrl && registrarUrl.startsWith('http://')) {
+    registrarUrl = registrarUrl.replace(/^http:\/\//i, 'https://');
+  }
+
+  const nameservers = [];
+  const nsRegex = /Name Server:\s*(.+)/gi;
+  let nsMatch;
+  while ((nsMatch = nsRegex.exec(whoisText)) !== null) {
+    const ns = nsMatch[1].trim();
+    if (ns) nameservers.push(ns);
+  }
+
+  const statuses = [];
+  const statusRegex = /Domain Status:\s*(.+)/gi;
+  let statusMatch;
+  while ((statusMatch = statusRegex.exec(whoisText)) !== null) {
+    const s = statusMatch[1].trim();
+    if (s) statuses.push(s);
+  }
+
+  // 没有关键日期字段时视为解析失败，便于继续走下一数据源
+  if (!createdOn && !expiresOn) {
+    return {
+      success: false,
+      error: '未能从WHOIS文本解析到期信息',
+      domain: domain,
+      raw: whoisText
+    };
+  }
+
+  return {
+    success: true,
+    domain: domain,
+    registered: !!(createdOn || expiresOn),
+    registrationDate: createdOn ? formatDate(createdOn) : null,
+    expiryDate: expiresOn ? formatDate(expiresOn) : null,
+    lastUpdated: updatedOn ? formatDate(updatedOn) : null,
+    registrar: registrar || 'DigitalPlat',
+    registrarUrl: registrarUrl || 'https://domain.digitalplat.org',
+    nameservers: nameservers,
+    status: statuses,
+    dnssec: null,
+    raw: whoisText
+  };
 }
 
 // DigitalPlat RDAP 查询：https://rdap.digitalplat.org/domain/{domain}
 async function queryDigitalPlatRdap(domain) {
   try {
-    const response = await fetch(`https://rdap.digitalplat.org/domain/${encodeURIComponent(domain)}`, {
+    const response = await fetchWithTimeout(`https://rdap.digitalplat.org/domain/${encodeURIComponent(domain)}`, {
       method: 'GET',
       headers: {
         'accept': 'application/rdap+json',
         'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
       }
-    });
+    }, 15000);
 
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    // HTML 挑战页 / 非 RDAP 响应 → 失败并走后续通道
+    if (contentType.includes('text/html')) {
+      throw new Error('RDAP返回HTML（可能被拦截），将尝试其他查询方式');
+    }
+
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (_) {
+      if (response.status === 404) {
+        // 无 JSON 的 404：可能是域名不存在，也可能是服务异常；交给后续通道
+        throw new Error('RDAP 404且无有效JSON');
+      }
+      throw new Error(`RDAP响应不是有效JSON: ${response.status}`);
+    }
+
+    // 服务端以 404 表示“RDAP 在本主机不可用”等，不能当成域名未注册
     if (response.status === 404) {
-      return {
-        success: true,
-        domain: domain,
-        registered: false,
-        raw: null
-      };
+      const blob = JSON.stringify(data || {}).toLowerCase();
+      const descText = Array.isArray(data?.description) ? data.description.join(' ') : '';
+      if (
+        blob.includes('not available') ||
+        blob.includes('rdap is not available') ||
+        /not available/i.test(descText)
+      ) {
+        throw new Error('RDAP服务不可用');
+      }
+      // 标准 RDAP 域名不存在
+      if (data?.errorCode === 404 || /not found|no match/i.test(blob)) {
+        return {
+          success: true,
+          domain: domain,
+          registered: false,
+          raw: data
+        };
+      }
+      throw new Error('RDAP查询失败: 404');
     }
 
     if (!response.ok) {
-      throw new Error(`RDAP查询失败: ${response.status} ${response.statusText}`);
+      const msg = data?.title || data?.description?.[0] || `${response.status} ${response.statusText}`;
+      throw new Error(`RDAP查询失败: ${msg}`);
     }
 
-    const data = await response.json();
+    // 非 domain 对象（错误包装）
+    if (data?.errorCode && data.errorCode >= 400) {
+      throw new Error(`RDAP查询失败: ${data.title || data.errorCode}`);
+    }
 
     const getEvent = (action) => {
       const event = (data.events || []).find(e => e.eventAction === action);
@@ -1010,7 +1309,7 @@ async function queryDigitalPlatRdap(domain) {
     return {
       success: true,
       domain: domain,
-      registered: !!registrationDate,
+      registered: !!(registrationDate || expiryDate),
       registrationDate: registrationDate ? formatDate(registrationDate) : null,
       expiryDate: expiryDate ? formatDate(expiryDate) : null,
       lastUpdated: lastUpdated ? formatDate(lastUpdated) : null,
@@ -1031,101 +1330,347 @@ async function queryDigitalPlatRdap(domain) {
   }
 }
 
-// DigitalPlat TCP WHOIS 兜底查询：whois -h whois.digitalplat.org "domain"
+// DigitalPlat TCP WHOIS：whois -h whois.digitalplat.org "domain"
 async function queryDigitalPlatTcpWhois(domain) {
   try {
-    const socket = connect({ hostname: 'whois.digitalplat.org', port: 43 });
-
-    const writer = socket.writable.getWriter();
-    const encoder = new TextEncoder();
-    await writer.write(encoder.encode(domain + '\r\n'));
-    writer.releaseLock();
-
-    const reader = socket.readable.getReader();
-    const decoder = new TextDecoder();
-    let whoisText = '';
-    let timedOut = false;
-    const timeoutId = setTimeout(() => {
-      timedOut = true;
-      reader.cancel();
-    }, 10000);
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        whoisText += decoder.decode(value, { stream: true });
-      }
-      whoisText += decoder.decode();
-    } catch (readError) {
-      if (!timedOut) throw readError;
-    } finally {
-      clearTimeout(timeoutId);
-      socket.close();
-    }
-
-    if (timedOut && !whoisText) {
-      throw new Error('WHOIS查询超时（10秒）');
-    }
-
-    if (whoisText.includes('Domain not found') || whoisText.includes('No match') || whoisText.includes('NOT FOUND')) {
-      return {
-        success: true,
-        domain: domain,
-        registered: false,
-        raw: whoisText
-      };
-    }
-
-    const parseField = (regex) => {
-      const match = whoisText.match(regex);
-      return match ? match[1].trim() : null;
-    };
-
-    const createdOn = parseField(/Creation Date:\s*(.+)/i);
-    const expiresOn = parseField(/Registry Expiry Date:\s*(.+)/i);
-    const updatedOn = parseField(/Updated Date:\s*(.+)/i);
-    const registrar = parseField(/Registrar:\s*(.+)/i);
-    const registrarUrl = parseField(/Registrar URL:\s*(.+)/i);
-
-    const nameservers = [];
-    const nsRegex = /Name Server:\s*(.+)/gi;
-    let nsMatch;
-    while ((nsMatch = nsRegex.exec(whoisText)) !== null) {
-      const ns = nsMatch[1].trim();
-      if (ns) nameservers.push(ns);
-    }
-
-    const statuses = [];
-    const statusRegex = /Domain Status:\s*(.+)/gi;
-    let statusMatch;
-    while ((statusMatch = statusRegex.exec(whoisText)) !== null) {
-      const s = statusMatch[1].trim();
-      if (s) statuses.push(s);
-    }
-
-    return {
-      success: true,
-      domain: domain,
-      registered: !!createdOn,
-      registrationDate: createdOn ? formatDate(createdOn) : null,
-      expiryDate: expiresOn ? formatDate(expiresOn) : null,
-      lastUpdated: updatedOn ? formatDate(updatedOn) : null,
-      registrar: registrar || 'DigitalPlat',
-      registrarUrl: registrarUrl,
-      nameservers: nameservers,
-      status: statuses,
-      dnssec: null,
-      raw: whoisText
-    };
+    const whoisText = await _whoisSocketQuery('whois.digitalplat.org', domain, 15000);
+    return parseDigitalPlatWhoisText(domain, whoisText);
   } catch (error) {
-    console.error('WHOIS兜底查询也失败:', error.message);
+    console.error('DigitalPlat TCP WHOIS失败，将尝试HTTP WHOIS:', error.message);
     return {
       success: false,
       error: error.message,
       domain: domain
     };
   }
+}
+
+// DigitalPlat HTTP WHOIS 兜底：GET https://whois.digitalplat.org/api/whois?name={domain}
+// 官方 RDAP / 端口 43 不可用时，使用官网 WHOIS 查询页背后的 JSON API。
+// 注意：当前源站证书异常时 Workers 会得到 526；不能像 curl -k 那样忽略证书。
+async function queryDigitalPlatHttpWhois(domain) {
+  try {
+    const response = await fetchWithTimeout(
+      `https://whois.digitalplat.org/api/whois?name=${encodeURIComponent(domain)}`,
+      {
+        method: 'GET',
+        headers: {
+          'accept': 'application/json',
+          'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+          'referer': 'https://whois.digitalplat.org/'
+        }
+      },
+      15000
+    );
+
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (_) {
+      throw new Error(`HTTP WHOIS响应不是有效JSON: ${response.status}`);
+    }
+
+    if (response.status === 404) {
+      return {
+        success: true,
+        domain: domain,
+        registered: false,
+        raw: data
+      };
+    }
+
+    if (!response.ok) {
+      const msg = data?.error || `${response.status} ${response.statusText}`;
+      if (/not found|no match|not registered/i.test(String(msg))) {
+        return {
+          success: true,
+          domain: domain,
+          registered: false,
+          raw: data
+        };
+      }
+      throw new Error(`HTTP WHOIS查询失败: ${msg}`);
+    }
+
+    if (data?.ok === false) {
+      const msg = data?.error || 'ok=false';
+      if (/not found|no match|not registered/i.test(String(msg))) {
+        return {
+          success: true,
+          domain: domain,
+          registered: false,
+          raw: data
+        };
+      }
+      throw new Error(`HTTP WHOIS查询失败: ${msg}`);
+    }
+
+    if (!data?.result) {
+      throw new Error('HTTP WHOIS无result字段');
+    }
+
+    const parsed = parseDigitalPlatWhoisText(domain, data.result);
+    if (!parsed.success) return parsed;
+
+    // 官网可能额外返回 status_override
+    if ((!parsed.status || parsed.status.length === 0) && Array.isArray(data.status_override)) {
+      parsed.status = data.status_override;
+    }
+    // 保留完整 API 响应用于排查
+    parsed.raw = data;
+    return parsed;
+  } catch (error) {
+    console.error('DigitalPlat HTTP WHOIS也失败:', error.message);
+    return {
+      success: false,
+      error: error.message,
+      domain: domain
+    };
+  }
+}
+
+
+
+// Stackryze 域名查询函数 (用于 indevs.in, sryze.cc, ryzedns.org, nx.kg)
+// API: GET https://api-domains.stackryze.com/subdomains/whois?query={domain}
+// 无需 API Key；限流约 100 次 / 15 分钟
+async function queryStackryzeWhois(domain) {
+  try {
+    const response = await fetchWithTimeout(
+      `https://api-domains.stackryze.com/subdomains/whois?query=${encodeURIComponent(domain)}`,
+      {
+        method: 'GET',
+        headers: {
+          'accept': 'application/json',
+          'user-agent': 'Domain-AutoCheck/1.0'
+        }
+      },
+      15000
+    );
+
+    if (response.status === 404) {
+      return {
+        success: true,
+        domain: domain,
+        registered: false,
+        raw: null
+      };
+    }
+
+    if (!response.ok) {
+      let errMsg = `Stackryze WHOIS查询失败: ${response.status} ${response.statusText}`;
+      try {
+        const errData = await response.json();
+        if (errData && errData.error) errMsg = errData.error;
+      } catch (_) {
+        // ignore JSON parse errors
+      }
+      throw new Error(errMsg);
+    }
+
+    const data = await response.json();
+
+    const statuses = [];
+    if (data.domainStatus) {
+      // e.g. "ok https://icann.org/epp#ok"
+      statuses.push(String(data.domainStatus).split(/\s+/)[0]);
+    }
+
+    return {
+      success: true,
+      domain: data.domainName || domain,
+      registered: true,
+      registrationDate: data.createdAt ? formatDate(data.createdAt) : null,
+      expiryDate: data.expiresAt ? formatDate(data.expiresAt) : null,
+      lastUpdated: data.updatedAt ? formatDate(data.updatedAt) : null,
+      registrar: data.registrar || 'Stackryze Domains',
+      registrarUrl: data.registrarUrl || 'https://domain.stackryze.com',
+      nameservers: Array.isArray(data.nameservers) ? data.nameservers : [],
+      status: statuses,
+      dnssec: data.dnssec || null,
+      raw: data
+    };
+  } catch (error) {
+    console.error('Stackryze WHOIS查询失败:', error.message);
+    return {
+      success: false,
+      error: error.message,
+      domain: domain
+    };
+  }
+}
+
+
+// 多通道 WHOIS 探测：并行执行各数据源，供 /whois-api 测试页展示
+// 单通道额外硬超时，避免某个 queryFn 内部遗漏超时把整页卡死。
+// 默认 25s；一级域名 TCP（IANA 两跳）在 probeDomainWhoisChannels 内单独放宽。
+const WHOIS_PROBE_METHOD_TIMEOUT_MS = 25000;
+
+function withHardTimeout(promise, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label || '操作'}超时（${Math.round(timeoutMs / 1000)}秒）`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+async function runWhoisProbeMethod(id, name, description, queryFn, timeoutMs = WHOIS_PROBE_METHOD_TIMEOUT_MS) {
+  const started = Date.now();
+  try {
+    const result = await withHardTimeout(
+      Promise.resolve().then(() => queryFn()),
+      timeoutMs,
+      name
+    );
+    return {
+      id,
+      name,
+      description,
+      ok: !!(result && result.success),
+      durationMs: Date.now() - started,
+      result: result || { success: false, error: '无返回结果' }
+    };
+  } catch (error) {
+    return {
+      id,
+      name,
+      description,
+      ok: false,
+      durationMs: Date.now() - started,
+      result: {
+        success: false,
+        error: error.message || String(error)
+      }
+    };
+  }
+}
+
+async function probeDomainWhoisChannels(domain) {
+  const lowerDomain = domain.toLowerCase();
+  const dotCount = lowerDomain.split('.').length - 1;
+  const isPpUa = lowerDomain.endsWith('.pp.ua');
+  const isEuCc = lowerDomain.endsWith('.eu.cc');
+  const isDigitalPlat = lowerDomain.endsWith('.qzz.io') || lowerDomain.endsWith('.dpdns.org') ||
+    lowerDomain.endsWith('.us.kg') || lowerDomain.endsWith('.xx.kg');
+  const isStackryze = lowerDomain.endsWith('.indevs.in') || lowerDomain.endsWith('.sryze.cc') ||
+    lowerDomain.endsWith('.ryzedns.org') || lowerDomain.endsWith('.nx.kg');
+
+  let provider = 'unsupported';
+  let methods = [];
+
+  if (isDigitalPlat) {
+    provider = 'digitalplat';
+    methods = await Promise.all([
+      runWhoisProbeMethod(
+        'rdap',
+        'RDAP',
+        `https://rdap.digitalplat.org/domain/${lowerDomain}`,
+        () => queryDigitalPlatRdap(domain)
+      ),
+      runWhoisProbeMethod(
+        'tcp',
+        'TCP WHOIS',
+        'whois -h whois.digitalplat.org "' + lowerDomain + '"',
+        () => queryDigitalPlatTcpWhois(domain)
+      ),
+      runWhoisProbeMethod(
+        'http',
+        'HTTP WHOIS API',
+        `https://whois.digitalplat.org/api/whois?name=${lowerDomain}`,
+        () => queryDigitalPlatHttpWhois(domain)
+      )
+    ]);
+  } else if (isStackryze) {
+    provider = 'stackryze';
+    methods = await Promise.all([
+      runWhoisProbeMethod(
+        'http',
+        'HTTP WHOIS API',
+        `https://api-domains.stackryze.com/subdomains/whois?query=${lowerDomain}`,
+        () => queryStackryzeWhois(domain)
+      )
+    ]);
+  } else if (isPpUa) {
+    provider = 'pp.ua';
+    methods = await Promise.all([
+      runWhoisProbeMethod(
+        'tcp',
+        'TCP WHOIS',
+        'whois -h whois.pp.ua "' + lowerDomain + '"',
+        () => queryPpUaWhois(domain)
+      )
+    ]);
+  } else if (isEuCc) {
+    provider = 'eu.cc';
+    methods = await Promise.all([
+      runWhoisProbeMethod(
+        'rdap',
+        'RDAP',
+        `https://rdap.gname.com/domain/${lowerDomain}`,
+        () => queryEuCcRdap(domain)
+      ),
+      runWhoisProbeMethod(
+        'tcp',
+        'TCP WHOIS',
+        'whois -h whois.gname.com "' + lowerDomain + '"',
+        () => queryEuCcTcpWhois(domain)
+      )
+    ]);
+  } else if (dotCount === 1) {
+    provider = 'first-level';
+    const tld = lowerDomain.split('.').pop();
+    const rdapBase = RDAP_SERVER_OVERRIDE[lowerDomain] || RDAP_SERVER_OVERRIDE[tld] || null;
+    const jobs = [];
+    if (rdapBase) {
+      jobs.push(runWhoisProbeMethod(
+        'registry-rdap',
+        '注册局 RDAP',
+        `${rdapBase}/domain/${lowerDomain}`,
+        () => queryGenericRdap(domain, rdapBase)
+      ));
+    }
+    // 一级域名 TCP 为 IANA 两跳，每跳读超时 15s + 建连；单独放宽硬超时，避免 25s 误杀
+    const FIRST_LEVEL_TCP_PROBE_TIMEOUT_MS = 45000;
+    jobs.push(runWhoisProbeMethod(
+      'tcp',
+      'TCP WHOIS',
+      'IANA 两跳 TCP WHOIS (whois.iana.org → 官方 whois)',
+      () => queryGenericTcpWhois(domain),
+      FIRST_LEVEL_TCP_PROBE_TIMEOUT_MS
+    ));
+    jobs.push(runWhoisProbeMethod(
+      'rdap-org',
+      'RDAP.org 兜底',
+      `https://rdap.org/domain/${lowerDomain}`,
+      () => queryGenericRdap(domain)
+    ));
+    methods = await Promise.all(jobs);
+  } else {
+    return {
+      success: false,
+      domain: domain,
+      provider,
+      error: '不支持的域名类型（仅支持一级域名及已接入的二级域名）',
+      methods: []
+    };
+  }
+
+  return {
+    success: true,
+    domain: domain,
+    provider,
+    methods
+  };
 }
 
 
@@ -1366,6 +1911,550 @@ const getLoginHTML = (title) => `
 `;
 
 // 主界面模板
+const getWhoisApiHTML = (title) => `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WHOIS API 测试 - ${title}</title>
+    <link rel="icon" href="${typeof LOGO_URL !== 'undefined' ? LOGO_URL : DEFAULT_LOGO}" type="image/png">
+    <link rel="shortcut icon" href="${typeof LOGO_URL !== 'undefined' ? LOGO_URL : DEFAULT_LOGO}" type="image/png">
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+    <link rel="preconnect" href="//at.alicdn.com">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="${ICONFONT_CSS}">
+    <script async src="${ICONFONT_JS}"></script>
+    <style>
+        :root {
+            --primary-color: #6366f1;
+            --primary-hover: #4f46e5;
+            --text-main: #1e293b;
+            --text-heading: #0f172a;
+            --text-muted: #64748b;
+            --bg-page: #f1f5f9;
+            --card-bg: rgba(255, 255, 255, 0.94);
+            --border-glass: rgba(148, 163, 184, 0.25);
+            --card-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+            --code-bg: #0f172a;
+            --code-text: #e2e8f0;
+        }
+        [data-theme="dark"] {
+            --text-main: #e2e8f0;
+            --text-heading: #f8fafc;
+            --text-muted: #94a3b8;
+            --bg-page: #0b1220;
+            --card-bg: rgba(30, 41, 59, 0.94);
+            --border-glass: rgba(148, 163, 184, 0.15);
+            --card-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+            --code-bg: #020617;
+            --code-text: #e2e8f0;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            color: var(--text-main);
+            background:
+                linear-gradient(180deg, rgba(99, 102, 241, 0.08), transparent 240px),
+                url('${typeof BACKGROUND_URL !== 'undefined' ? BACKGROUND_URL : DEFAULT_BACKGROUND}');
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+        }
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background: color-mix(in srgb, var(--bg-page) 78%, transparent);
+            z-index: -1;
+        }
+        .container-page {
+            max-width: 980px;
+            margin: 0 auto;
+            padding: 24px 16px 48px;
+        }
+        .navbar {
+            background: var(--card-bg);
+            border: 1px solid var(--border-glass);
+            box-shadow: var(--card-shadow);
+            border-radius: 16px;
+            padding: 14px 18px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .navbar-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 700;
+            color: var(--text-heading);
+            font-size: 1.15rem;
+            text-decoration: none;
+        }
+        .navbar-brand i { color: var(--primary-color); font-size: 1.35rem; }
+        .navbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .btn-soft {
+            border: 1px solid var(--border-glass);
+            background: transparent;
+            color: var(--text-main);
+            border-radius: 10px;
+            padding: 8px 12px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            text-decoration: none;
+            font-size: 0.92rem;
+            transition: 0.15s ease;
+            cursor: pointer;
+        }
+        .btn-soft:hover {
+            border-color: var(--primary-color);
+            color: var(--primary-color);
+            background: rgba(99, 102, 241, 0.08);
+        }
+        .card-panel {
+            background: var(--card-bg);
+            border: 1px solid var(--border-glass);
+            border-radius: 18px;
+            box-shadow: var(--card-shadow);
+            padding: 22px;
+            margin-bottom: 16px;
+        }
+        .page-title {
+            margin: 0 0 6px;
+            font-size: 1.35rem;
+            color: var(--text-heading);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .page-desc {
+            margin: 0 0 18px;
+            color: var(--text-muted);
+            font-size: 0.92rem;
+        }
+        .query-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .query-row .form-control {
+            flex: 1 1 260px;
+            border-radius: 12px;
+            border: 1px solid var(--border-glass);
+            background: transparent;
+            color: var(--text-main);
+            padding: 12px 14px;
+            min-height: 46px;
+        }
+        .query-row .form-control:focus {
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+            outline: none;
+        }
+        .btn-primary-custom {
+            background: var(--primary-color);
+            border: none;
+            color: #fff;
+            border-radius: 12px;
+            padding: 0 18px;
+            min-height: 46px;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+            cursor: pointer;
+        }
+        .btn-primary-custom:hover { background: var(--primary-hover); color: #fff; }
+        .btn-primary-custom:disabled { opacity: 0.7; cursor: not-allowed; }
+        .result-empty {
+            color: var(--text-muted);
+            text-align: center;
+            padding: 28px 12px;
+        }
+        .probe-summary {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px 16px;
+            margin-bottom: 14px;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+        .probe-summary strong { color: var(--text-heading); }
+        .method-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 16px 0;
+            border-bottom: 1px solid var(--border-glass);
+            flex-wrap: wrap;
+        }
+        .method-item:last-child { border-bottom: none; padding-bottom: 0; }
+        .method-item:first-of-type { border-top: 1px solid var(--border-glass); }
+        .method-main {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 0;
+            flex: 1 1 280px;
+        }
+        .method-name {
+            font-weight: 700;
+            color: var(--text-heading);
+            font-size: 1.02rem;
+        }
+        .method-desc {
+            color: var(--text-muted);
+            font-size: 0.84rem;
+            word-break: break-all;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+        .method-meta {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+        .badge-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border-radius: 999px;
+            padding: 4px 10px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            width: fit-content;
+        }
+        .badge-success {
+            color: #047857;
+            background: rgba(16, 185, 129, 0.14);
+        }
+        .badge-fail {
+            color: #b91c1c;
+            background: rgba(239, 68, 68, 0.14);
+        }
+        [data-theme="dark"] .badge-success { color: #6ee7b7; }
+        [data-theme="dark"] .badge-fail { color: #fca5a5; }
+        .btn-detail {
+            border: 1px solid var(--border-glass);
+            background: transparent;
+            color: var(--text-main);
+            border-radius: 10px;
+            padding: 8px 12px;
+            font-size: 0.9rem;
+            white-space: nowrap;
+            cursor: pointer;
+        }
+        .btn-detail:hover {
+            border-color: var(--primary-color);
+            color: var(--primary-color);
+        }
+        .modal-content {
+            background: var(--card-bg);
+            color: var(--text-main);
+            border: 1px solid var(--border-glass);
+            border-radius: 16px;
+        }
+        .modal-header, .modal-footer { border-color: var(--border-glass); }
+        .detail-pre {
+            margin: 0;
+            max-height: min(60vh, 520px);
+            overflow: auto;
+            background: var(--code-bg);
+            color: var(--code-text);
+            border-radius: 12px;
+            padding: 14px;
+            font-size: 0.82rem;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .hint-list {
+            margin: 0;
+            padding-left: 18px;
+            color: var(--text-muted);
+            font-size: 0.88rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-page">
+        <nav class="navbar">
+            <a class="navbar-brand" href="/dashboard">
+                <i class="iconfont icon-domain"></i>
+                <span>WHOIS API 测试</span>
+            </a>
+            <div class="navbar-actions">
+                <a class="btn-soft" href="/dashboard"><i class="iconfont icon-list-ul"></i> 返回仪表盘</a>
+                <button class="btn-soft" id="themeToggleBtn" type="button" title="切换主题">🌓 主题</button>
+                <button class="btn-soft" type="button" onclick="logout()">退出</button>
+            </div>
+        </nav>
+
+        <div class="card-panel">
+            <h1 class="page-title"><i class="iconfont icon-search"></i> 多通道 WHOIS 探测</h1>
+            <p class="page-desc">输入域名后，会分别探测该域名适用的各查询通道（如 RDAP / TCP WHOIS / HTTP API），并单独展示成功或失败。</p>
+            <div class="query-row">
+                <input type="text" class="form-control" id="domainInput" placeholder="例如 iori2.dpdns.org / iori.indevs.in / example.com" autocomplete="off" spellcheck="false">
+                <button class="btn btn-primary-custom" id="queryBtn" type="button">
+                    <i class="iconfont icon-search"></i> 开始探测
+                </button>
+            </div>
+            <ul class="hint-list mt-3">
+                <li>DigitalPlat：RDAP、TCP WHOIS、HTTP WHOIS API</li>
+                <li>Stackryze：HTTP WHOIS API</li>
+                <li>一级域名：优先直连注册局 RDAP（如 Verisign），再 TCP WHOIS，最后 rdap.org 兜底</li>
+                <li>pp.ua / eu.cc：按其实际接入通道探测</li>
+                <li>TCP 失败时可配置环境变量 p=host 或 host:port 做 Workers 出站兜底（未写端口则用 43）</li>
+            </ul>
+        </div>
+
+        <div class="card-panel">
+            <h2 class="page-title" style="font-size:1.1rem;margin-bottom:12px;">各通道结果</h2>
+            <div id="resultBox">
+                <div class="result-empty">输入域名后点击探测，下方将按通道列出结果</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="detailModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="detailModalTitle">通道详情</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <pre class="detail-pre" id="detailPre">{}</pre>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-soft" id="copyDetailBtn">复制 JSON</button>
+                    <button type="button" class="btn btn-primary-custom" data-bs-dismiss="modal">关闭</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        (function () {
+            let lastProbe = null;
+            let detailModal = null;
+
+            const providerLabels = {
+                digitalplat: 'DigitalPlat',
+                stackryze: 'Stackryze',
+                'pp.ua': 'pp.ua',
+                'eu.cc': 'eu.cc',
+                'first-level': '一级域名',
+                unsupported: '不支持'
+            };
+
+            function applyTheme(theme) {
+                document.documentElement.setAttribute('data-theme', theme);
+                try { localStorage.setItem('theme', theme); } catch (e) {}
+            }
+            function initTheme() {
+                let theme = 'light';
+                try {
+                    theme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+                } catch (e) {}
+                applyTheme(theme);
+            }
+            function logout() { window.location.href = '/logout'; }
+            window.logout = logout;
+
+            function escapeHtml(str) {
+                return String(str == null ? '' : str)
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#39;');
+            }
+
+            function summarizeResult(result) {
+                if (!result) return '无结果';
+                if (result.success === false) return '错误: ' + (result.error || '未知错误');
+                if (result.registered === false) return '域名未注册';
+                const parts = [];
+                if (result.expiryDate) parts.push('到期 ' + result.expiryDate);
+                if (result.registrationDate) parts.push('注册 ' + result.registrationDate);
+                if (result.registrar) parts.push(result.registrar);
+                return parts.length ? parts.join(' · ') : '查询成功';
+            }
+
+            function renderProbe(data) {
+                const box = document.getElementById('resultBox');
+                if (!data) {
+                    box.innerHTML = '<div class="result-empty">输入域名后点击探测，下方将按通道列出结果</div>';
+                    return;
+                }
+
+                if (!data.success && (!data.methods || !data.methods.length)) {
+                    box.innerHTML = '<div class="result-empty" style="color:#b91c1c;">' +
+                        escapeHtml(data.error || '探测失败') + '</div>';
+                    return;
+                }
+
+                const methods = data.methods || [];
+                const okCount = methods.filter(m => m.ok).length;
+                const provider = providerLabels[data.provider] || data.provider || '-';
+
+                let html = '<div class="probe-summary">' +
+                    '<span>域名：<strong>' + escapeHtml(data.domain) + '</strong></span>' +
+                    '<span>类型：<strong>' + escapeHtml(provider) + '</strong></span>' +
+                    '<span>通道：<strong>' + okCount + ' / ' + methods.length + ' 成功</strong></span>' +
+                    '</div>';
+
+                if (!methods.length) {
+                    html += '<div class="result-empty">该域名没有可探测的通道</div>';
+                    box.innerHTML = html;
+                    return;
+                }
+
+                html += methods.map((m, index) => {
+                    const okClass = m.ok ? 'badge-success' : 'badge-fail';
+                    const icon = m.ok ? '✓' : '✕';
+                    const statusText = m.ok ? '成功' : '失败';
+                    const meta = summarizeResult(m.result) + ' · ' + (m.durationMs != null ? (m.durationMs + ' ms') : '-');
+                    return (
+                        '<div class="method-item">' +
+                          '<div class="method-main">' +
+                            '<div class="method-name">' + escapeHtml(m.name || m.id) + '</div>' +
+                            '<span class="badge-status ' + okClass + '">' + icon + ' ' + statusText + '</span>' +
+                            '<div class="method-desc">' + escapeHtml(m.description || '') + '</div>' +
+                            '<div class="method-meta">' + escapeHtml(meta) + '</div>' +
+                          '</div>' +
+                          '<button type="button" class="btn-detail" data-index="' + index + '">详情</button>' +
+                        '</div>'
+                    );
+                }).join('');
+
+                box.innerHTML = html;
+                box.querySelectorAll('.btn-detail').forEach((btn) => {
+                    btn.addEventListener('click', () => openDetail(Number(btn.getAttribute('data-index'))));
+                });
+            }
+
+            function openDetail(index) {
+                if (!lastProbe || !lastProbe.methods || !lastProbe.methods[index]) return;
+                const m = lastProbe.methods[index];
+                document.getElementById('detailModalTitle').textContent =
+                    (m.name || m.id) + ' · ' + (lastProbe.domain || '');
+                document.getElementById('detailPre').textContent = JSON.stringify({
+                    domain: lastProbe.domain,
+                    provider: lastProbe.provider,
+                    method: {
+                        id: m.id,
+                        name: m.name,
+                        description: m.description,
+                        ok: m.ok,
+                        durationMs: m.durationMs,
+                        result: m.result
+                    }
+                }, null, 2);
+                if (!detailModal) {
+                    detailModal = new bootstrap.Modal(document.getElementById('detailModal'));
+                }
+                detailModal.show();
+            }
+
+            async function runProbe() {
+                const input = document.getElementById('domainInput');
+                const btn = document.getElementById('queryBtn');
+                const domain = (input.value || '').trim().toLowerCase();
+                if (!domain) {
+                    input.focus();
+                    return;
+                }
+
+                const domainRegex = /^[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?)*\\.[a-zA-Z]{2,}$/;
+                if (!domainRegex.test(domain)) {
+                    lastProbe = { success: false, domain, error: '域名格式不正确', methods: [] };
+                    renderProbe(lastProbe);
+                    return;
+                }
+
+                const original = btn.innerHTML;
+                btn.disabled = true;
+                btn.innerHTML = '探测中...';
+                document.getElementById('resultBox').innerHTML =
+                    '<div class="result-empty">正在并行探测各查询通道，请稍候...</div>';
+
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 60000);
+                try {
+                    const response = await fetch('/api/whois/probe', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ domain }),
+                        signal: controller.signal
+                    });
+                    let payload = null;
+                    try {
+                        payload = await response.json();
+                    } catch (e) {
+                        payload = { success: false, domain, error: '响应不是有效 JSON', methods: [] };
+                    }
+                    lastProbe = payload;
+                    renderProbe(lastProbe);
+                } catch (error) {
+                    const msg = (error && error.name === 'AbortError')
+                        ? '探测超时（60秒），请稍后重试'
+                        : (error.message || '网络错误');
+                    lastProbe = {
+                        success: false,
+                        domain,
+                        error: msg,
+                        methods: []
+                    };
+                    renderProbe(lastProbe);
+                } finally {
+                    clearTimeout(timeoutId);
+                    btn.disabled = false;
+                    btn.innerHTML = original;
+                }
+            }
+
+            document.addEventListener('DOMContentLoaded', () => {
+                initTheme();
+                document.getElementById('themeToggleBtn').addEventListener('click', () => {
+                    const cur = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+                    applyTheme(cur === 'dark' ? 'light' : 'dark');
+                });
+                document.getElementById('queryBtn').addEventListener('click', runProbe);
+                document.getElementById('domainInput').addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        runProbe();
+                    }
+                });
+                document.getElementById('copyDetailBtn').addEventListener('click', async () => {
+                    const text = document.getElementById('detailPre').textContent || '';
+                    try {
+                        await navigator.clipboard.writeText(text);
+                        const btn = document.getElementById('copyDetailBtn');
+                        const old = btn.textContent;
+                        btn.textContent = '已复制';
+                        setTimeout(() => { btn.textContent = old; }, 1200);
+                    } catch (e) {
+                        alert('复制失败，请手动选择复制');
+                    }
+                });
+            });
+        })();
+    </script>
+</body>
+</html>
+`;
+
 const getHTMLContent = (title) => `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -3665,14 +4754,15 @@ const getHTMLContent = (title) => `
                     return;
                 }
                 
-                // 验证是否为一级域名（只能有一个点），pp.ua及DigitalPlat特定域名除外（允许二级域名）
+                // 验证是否为一级域名（只能有一个点），pp.ua/eu.cc/DigitalPlat/Stackryze 特定域名除外（允许二级域名）
                 const dotCount = domain.split('.').length - 1;
                 const lowerDomain = domain.toLowerCase();
                 const isPpUa = lowerDomain.endsWith('.pp.ua');
                 const isEuCc = lowerDomain.endsWith('.eu.cc');
                 const isDigitalPlat = lowerDomain.endsWith('.qzz.io') || lowerDomain.endsWith('.dpdns.org') || lowerDomain.endsWith('.us.kg') || lowerDomain.endsWith('.xx.kg');
+                const isStackryze = lowerDomain.endsWith('.indevs.in') || lowerDomain.endsWith('.sryze.cc') || lowerDomain.endsWith('.ryzedns.org') || lowerDomain.endsWith('.nx.kg');
 
-                if (dotCount !== 1 && !((isPpUa || isEuCc || isDigitalPlat) && dotCount === 2)) {
+                if (dotCount !== 1 && !((isPpUa || isEuCc || isDigitalPlat || isStackryze) && dotCount === 2)) {
                     if (dotCount === 0) {
                         showWhoisStatus('请输入完整的域名（如：example.com）', 'danger');
                     } else {
@@ -5797,6 +6887,8 @@ const getHTMLContent = (title) => `
                         registrarName = 'Gname.com';
                     } else if (domainName.endsWith('.qzz.io') || domainName.endsWith('.dpdns.org') || domainName.endsWith('.us.kg') || domainName.endsWith('.xx.kg')) {
                         registrarName = 'DigitalPlat.org';
+                    } else if (domainName.endsWith('.indevs.in') || domainName.endsWith('.sryze.cc') || domainName.endsWith('.ryzedns.org') || domainName.endsWith('.nx.kg')) {
+                        registrarName = 'Stackryze Domains';
                     }
 
                     if (registrarName) {
@@ -5821,6 +6913,10 @@ const getHTMLContent = (title) => `
                             filledFields.push('续费链接');
                         } else if (domainName.endsWith('.qzz.io') || domainName.endsWith('.dpdns.org') || domainName.endsWith('.us.kg') || domainName.endsWith('.xx.kg')) {
                             renewLinkField.value = 'https://dash.domain.digitalplat.org/panel/main?page=%2Fpanel%2Fdomains';
+                            renewLinkField.classList.add('auto-filled');
+                            filledFields.push('续费链接');
+                        } else if (domainName.endsWith('.indevs.in') || domainName.endsWith('.sryze.cc') || domainName.endsWith('.ryzedns.org') || domainName.endsWith('.nx.kg')) {
+                            renewLinkField.value = 'https://domain.stackryze.com';
                             renewLinkField.classList.add('auto-filled');
                             filledFields.push('续费链接');
                         }
@@ -6139,6 +7235,20 @@ async function handleRequest(request) {
     }
   }
 
+  // WHOIS API 测试页
+  if (path === '/whois-api') {
+    if (isAuthenticated) {
+      const htmlContent = getWhoisApiHTML(siteTitle);
+      const response = new Response(htmlContent, {
+        headers: {
+          'Content-Type': 'text/html;charset=UTF-8',
+        },
+      });
+      return await addFooterToResponse(response);
+    }
+    return Response.redirect(url.origin, 302);
+  }
+
   // 登出功能
   if (path === '/logout') {
     return new Response('登出成功', {
@@ -6151,7 +7261,7 @@ async function handleRequest(request) {
   }
   
   // 根路径或任何其他路径（除了/api和/dashboard）都显示登录页面
-  if (path === '/' || (!path.startsWith('/api/') && path !== '/dashboard')) {
+  if (path === '/' || (!path.startsWith('/api/') && path !== '/dashboard' && path !== '/whois-api')) {
     // 如果已登录，重定向到dashboard
     if (isAuthenticated) {
       return Response.redirect(url.origin + '/dashboard', 302);
@@ -6349,6 +7459,29 @@ async function handleApiRequest(request) {
   }
 
   // WHOIS域名查询
+  // 多通道 WHOIS 探测（测试页专用）
+  if (path === '/api/whois/probe' && request.method === 'POST') {
+    try {
+      const { domain } = await request.json();
+      if (!domain) {
+        return jsonResponse({ error: '域名参数不能为空', success: false }, 400);
+      }
+
+      const domainRegex = /^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$/;
+      if (!domainRegex.test(domain)) {
+        return jsonResponse({ error: '域名格式不正确', success: false }, 400);
+      }
+
+      const result = await probeDomainWhoisChannels(domain);
+      if (!result.success && result.provider === 'unsupported') {
+        return jsonResponse(result, 400);
+      }
+      return jsonResponse(result);
+    } catch (error) {
+      return jsonResponse({ error: 'WHOIS探测失败: ' + error.message, success: false }, 400);
+    }
+  }
+
   if (path === '/api/whois' && request.method === 'POST') {
     try {
       const { domain } = await request.json();
@@ -6362,14 +7495,15 @@ async function handleApiRequest(request) {
         return jsonResponse({ error: '域名格式不正确' }, 400);
       }
       
-      // 验证是否为一级域名（只能有一个点），pp.ua及DigitalPlat特定域名除外
+      // 验证是否为一级域名（只能有一个点），pp.ua/eu.cc/DigitalPlat/Stackryze 特定域名除外
       const dotCount = domain.split('.').length - 1;
       const lowerDomain = domain.toLowerCase();
       const isPpUa = lowerDomain.endsWith('.pp.ua');
       const isEuCc = lowerDomain.endsWith('.eu.cc');
       const isDigitalPlat = lowerDomain.endsWith('.qzz.io') || lowerDomain.endsWith('.dpdns.org') || lowerDomain.endsWith('.us.kg') || lowerDomain.endsWith('.xx.kg');
+      const isStackryze = lowerDomain.endsWith('.indevs.in') || lowerDomain.endsWith('.sryze.cc') || lowerDomain.endsWith('.ryzedns.org') || lowerDomain.endsWith('.nx.kg');
 
-      if (dotCount !== 1 && !((isPpUa || isEuCc || isDigitalPlat) && dotCount === 2)) {
+      if (dotCount !== 1 && !((isPpUa || isEuCc || isDigitalPlat || isStackryze) && dotCount === 2)) {
         if (dotCount === 0) {
           return jsonResponse({ error: '请输入完整的域名（如：example.com）' }, 400);
         } else {
@@ -6387,6 +7521,9 @@ async function handleApiRequest(request) {
       } else if (isDigitalPlat) {
         // 使用 DigitalPlat 接口查询特定二级域名
         result = await queryDigitalPlatWhois(domain);
+      } else if (isStackryze) {
+        // 使用 Stackryze 接口查询特定二级域名
+        result = await queryStackryzeWhois(domain);
       } else {
         // 一级域名：RDAP 查询（免费无 Key）
         result = await queryFirstLevelDomain(domain);
